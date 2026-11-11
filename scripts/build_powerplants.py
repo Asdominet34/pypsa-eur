@@ -88,6 +88,67 @@ def add_custom_powerplants(ppl, custom_powerplants, custom_ppl_query=False):
     )
 
 
+EXTERNAL_HYDRO_TECHNOLOGY = {
+    "ror": "Run-Of-River",
+    "hydro": "Reservoir",
+    "PHS": "Pumped Storage",
+}
+
+
+def replace_with_external_hydro(ppl, plants_fn, countries, keep_storage=True):
+    """
+    Replace the powerplantmatching hydro plants with the plants of an external
+    dataset (macro-hydro-inputs).
+
+    The plants keep their ``plant_id``, which links them to the inflow series.
+    ``StorageCapacity_MWh`` is the live storage without turbine efficiency.
+    With ``keep_storage=False`` only the fleet is used: storage is left empty, so
+    that add_electricity fills it as upstream (hydro_capacities.csv, PHS_max_hours).
+    """
+    plants = pd.read_csv(plants_fn, dtype={"plant_id": str})
+    plants = plants[plants.country.isin(countries)]
+
+    unknown = set(plants.carrier) - set(EXTERNAL_HYDRO_TECHNOLOGY)
+    if unknown:
+        raise ValueError(f"{plants_fn}: unknown carrier(s) {sorted(unknown)}")
+    if plants.plant_id.duplicated().any():
+        raise ValueError(f"{plants_fn}: duplicated plant_id")
+
+    external = pd.DataFrame(
+        {
+            "Name": plants.name.fillna(plants.plant_id),
+            "Fueltype": "Hydro",
+            "Technology": plants.carrier.map(EXTERNAL_HYDRO_TECHNOLOGY),
+            "Set": np.where(plants.carrier == "ror", "PP", "Store"),
+            "Country": plants.country,
+            "Capacity": plants.capacity_mw,
+            "Efficiency": np.nan,
+            "DateIn": plants.datein,
+            "DateRetrofit": np.nan,
+            "DateOut": plants.dateout,
+            "lat": plants.lat,
+            "lon": plants.lon,
+            "Duration": plants.storage_mwh / plants.capacity_mw,
+            "Volume_Mm3": plants.volume_mm3,
+            "DamHeight_m": np.nan,
+            "StorageCapacity_MWh": plants.storage_mwh,
+            "plant_id": plants.plant_id,
+            "eta_design": plants.eta_design,
+        }
+    )
+
+    if not keep_storage:
+        external[["Duration", "Volume_Mm3", "StorageCapacity_MWh"]] = np.nan
+
+    is_hydro = ppl.Fueltype == "Hydro"
+    logger.info(
+        f"External hydro: replacing {is_hydro.sum()} powerplantmatching hydro plants "
+        f"({ppl.loc[is_hydro, 'Capacity'].sum() / 1e3:.1f} GW) with {len(external)} plants "
+        f"({external.Capacity.sum() / 1e3:.1f} GW) from {plants_fn}"
+    )
+    return pd.concat([ppl[~is_hydro], external], sort=False, ignore_index=True)
+
+
 def add_everywhere_powerplants(ppl, substations, everywhere_powerplants):
     # Create a dataframe with "everywhere_powerplants" of stated carriers at the location of all substations
     everywhere_ppl = (
@@ -235,9 +296,32 @@ if __name__ == "__main__":
         .replace({"Solid Biomass": "Bioenergy", "Biogas": "Bioenergy"})
     )
 
+    # before the filter, so that the date conditions apply to the external plants too
+    external_hydro = snakemake.params.external_hydro
+    if external_hydro.get("enable", False):
+        ppl = replace_with_external_hydro(
+            ppl,
+            snakemake.input.external_hydro_plants,
+            countries,
+            keep_storage=external_hydro.get("inflow_and_storage", "external")
+            == "external",
+        )
+
     ppl_query = snakemake.params.powerplants_filter
     if isinstance(ppl_query, str):
         ppl.query(ppl_query, inplace=True)
+
+    if external_hydro.get("enable", False):
+        kept = ppl[ppl.plant_id.notna()]
+        if kept.empty:
+            raise ValueError(
+                "External hydro: no plant left after `powerplants_filter`; "
+                "remove any Fueltype != 'Hydro' condition from it."
+            )
+        logger.info(
+            "External hydro after `powerplants_filter` (MW):\n"
+            f"{kept.groupby(['Country', 'Technology']).Capacity.sum().unstack(fill_value=0).round()}"
+        )
 
     # add carriers from own powerplant files:
     custom_ppl_query = snakemake.params.custom_powerplants

@@ -8,6 +8,8 @@ Renewable energy configuration.
 See docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#renewable
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from scripts.lib.validation.config._base import ConfigModel
@@ -258,8 +260,42 @@ class _SolarConfig(BaseModel):
     )
 
 
+class _HydroExternalConfig(BaseModel):
+    """Configuration for plant-level hydro from an external dataset (macro-hydro-inputs)."""
+
+    enable: bool = Field(
+        False,
+        description="Replace powerplantmatching hydro plants and the ERA5 runoff inflow with the plants and inflows of an external dataset.",
+    )
+    plants: str = Field(
+        "",
+        description="Plant table: plant_id, name, country, carrier (ror|hydro|PHS), capacity_mw, lat, lon, datein, dateout, storage_mwh, eta_design.",
+    )
+    inflow: str = Field(
+        "",
+        description="Inflow NetCDF per weather year, with `{year}` in the path: inflow [MW] (hydro, PHS) and p_max_pu (ror) on (time, plant). Inflow and storage exclude turbine efficiency.",
+    )
+    inflow_and_storage: Literal["external", "pypsa"] = Field(
+        "external",
+        description="'external': inflow and storage of the external dataset, reservoirs per plant. 'pypsa': only the plant fleet is external; inflow from ERA5 runoff per country and storage from hydro_capacities.csv and PHS_max_hours, as upstream.",
+    )
+    efficiency: Literal["costs", "plants"] = Field(
+        "costs",
+        description="Discharge efficiency of reservoirs: 'costs' uses the technology-data value, 'plants' the design efficiency of each plant (eta_design).",
+    )
+    reservoir_units: str = Field(
+        "",
+        description="Aggregated reservoirs: CSV plant_id, unit (macro-hydro-inputs scripts/aggregation/units.py). One storage unit per unit and bus, capacity, storage and inflow summed. Empty: one storage unit per plant. Set it only in the overlay config of an aggregated run.",
+    )
+
+
 class _HydroConfig(BaseModel):
     """Configuration for hydropower."""
+
+    external: _HydroExternalConfig = Field(
+        default_factory=_HydroExternalConfig,
+        description="Plant-level hydro from an external dataset.",
+    )
 
     cutout: str | list[str] = Field(
         "default", description="Specifies the weather data cutout file(s) to use."
@@ -299,6 +335,10 @@ class _HydroConfig(BaseModel):
     eia_approximate_missing: bool = Field(
         False,
         description="Approximate hydro generation data for years not included in EIA dataset through a regression based on annual runoff.",
+    )
+    entsoe_annual_generation: str = Field(
+        "",
+        description="CSV of observed annual hydro generation per country (year, country, hydro_generation_mwh), e.g. ENTSO-E without pumped storage. When set, it replaces the EIA statistics used to normalise the runoff inflow, for the countries and years it covers.",
     )
 
 

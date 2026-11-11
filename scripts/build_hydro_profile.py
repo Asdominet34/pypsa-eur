@@ -23,6 +23,7 @@ import logging
 import country_converter as coco
 import geopandas as gpd
 import pandas as pd
+import xarray as xr
 from numpy.polynomial import Polynomial
 
 from scripts._helpers import (
@@ -138,6 +139,82 @@ def approximate_missing_eia_stats(
 
 logger = logging.getLogger(__name__)
 
+
+def override_eia_stats(eia_stats: pd.DataFrame, fn: str, countries: list[str]) -> pd.DataFrame:
+    """
+    Replace the EIA annual hydro generation with observed annual totals per country
+    (columns year, country, hydro_generation_mwh), for the countries and years in the file.
+
+    Same as the ENTSO-E override of the GLOFAS-EFAS-hydromodeling fork (pypsa-eur-hydro).
+    """
+    observed = pd.read_csv(fn)
+    missing = {"year", "country", "hydro_generation_mwh"}.difference(observed.columns)
+    if missing:
+        raise ValueError(f"Missing columns in {fn}: {sorted(missing)}")
+    observed = observed[observed.country.isin(countries)].astype({"year": int})
+    observed = observed.pivot_table(
+        index="year", columns="country", values="hydro_generation_mwh", aggfunc="first"
+    )
+    for year in observed.index:
+        if year not in eia_stats.index:
+            eia_stats.loc[year, :] = pd.NA
+        common = observed.columns.intersection(eia_stats.columns)
+        eia_stats.loc[year, common] = observed.loc[year, common]
+    logger.info(
+        f"Replaced EIA hydro generation with {fn} for years {observed.index.tolist()}"
+    )
+    return eia_stats.sort_index()
+
+
+def build_external_hydro_profile(
+    inflow_fns: list[str],
+    plants_fn: str,
+    countries: list[str],
+    time: pd.DatetimeIndex,
+) -> xr.Dataset:
+    """
+    Read plant-level hydro series of an external dataset (macro-hydro-inputs).
+
+    Returns ``inflow`` [MW] for hydro and PHS plants and ``p_max_pu`` for ror
+    plants on (time, plant), for the plants of the modelled countries. Inflow
+    excludes turbine efficiency: it is applied on discharge.
+    """
+    plants = pd.read_csv(plants_fn, dtype={"plant_id": str}, index_col="plant_id")
+    plants = plants[plants.country.isin(countries)]
+
+    with xr.open_mfdataset(inflow_fns, combine="by_coords") as ds:
+        ds = ds.assign_coords(plant=ds.indexes["plant"].astype(str))
+        missing_plants = plants.index.difference(ds.indexes["plant"])
+        if not missing_plants.empty:
+            raise ValueError(
+                f"No inflow series for {len(missing_plants)} plants, "
+                f"e.g. {list(missing_plants[:10])}"
+            )
+        missing_time = time.difference(ds.indexes["time"])
+        if not missing_time.empty:
+            raise ValueError(
+                f"{len(missing_time)} snapshots missing in {inflow_fns}, "
+                f"e.g. {list(missing_time[:5])} (the files have no 29 February)"
+            )
+        ds = ds[["inflow", "p_max_pu"]].sel(time=time, plant=plants.index).load()
+
+    is_ror = plants.carrier == "ror"
+    for var, needed in (("p_max_pu", is_ror), ("inflow", ~is_ror)):
+        values = ds[var].sel(plant=plants.index[needed])
+        if values.isnull().any():
+            bad = values.plant[values.isnull().any("time")].values[:10]
+            raise ValueError(f"NaN in '{var}' of plants {list(bad)}")
+
+    ds["inflow"] = ds["inflow"].clip(min=0.0).astype("float32")
+    ds["p_max_pu"] = ds["p_max_pu"].clip(0.0, 1.0).astype("float32")
+    logger.info(
+        f"External hydro: {len(plants)} plants, inflow "
+        f"{float(ds['inflow'].sel(plant=plants.index[~is_ror]).sum()) / 1e6:.1f} TWh "
+        f"(hydro and PHS, before efficiency)"
+    )
+    return ds
+
+
 if __name__ == "__main__":
     if "snakemake" not in globals():
         from scripts._helpers import mock_snakemake
@@ -150,63 +227,83 @@ if __name__ == "__main__":
 
     time = get_snapshots(snakemake.params.snapshots, snakemake.params.drop_leap_day)
 
-    cutout = load_cutout(snakemake.input.cutout)
-
-    years_in_time = pd.DatetimeIndex(time).year.unique()
-    cutout_time = pd.DatetimeIndex(cutout.coords["time"].values)
-
-    full_years_available = all(
-        pd.Timestamp(f"{year}-01-01") in cutout_time
-        and pd.Timestamp(f"{year}-12-31") in cutout_time
-        for year in years_in_time
-    )
-
-    if full_years_available:
-        mask = [pd.Timestamp(t).year in years_in_time for t in cutout_time]
-        cutout = cutout.sel(time=cutout_time[mask])
+    external = params_hydro.get("external", {})
+    if (
+        external.get("enable", False)
+        and external.get("inflow_and_storage", "external") == "external"
+    ):
+        build_external_hydro_profile(
+            snakemake.input.external_hydro_inflow,
+            snakemake.input.external_hydro_plants,
+            snakemake.params.countries,
+            pd.DatetimeIndex(time),
+        ).to_netcdf(
+            snakemake.output.profile,
+            encoding={v: {"zlib": True, "complevel": 4} for v in ("inflow", "p_max_pu")},
+        )
     else:
-        cutout = cutout.sel(time=time)
+        cutout = load_cutout(snakemake.input.cutout)
 
-    countries = snakemake.params.countries
-    country_shapes = (
-        gpd.read_file(snakemake.input.country_shapes)
-        .set_index("name")["geometry"]
-        .reindex(countries)
-    )
-    country_shapes.index.name = "countries"
+        years_in_time = pd.DatetimeIndex(time).year.unique()
+        cutout_time = pd.DatetimeIndex(cutout.coords["time"].values)
 
-    fn = snakemake.input.eia_hydro_generation
-    eia_stats = get_eia_annual_hydro_generation(fn, countries)
+        full_years_available = all(
+            pd.Timestamp(f"{year}-01-01") in cutout_time
+            and pd.Timestamp(f"{year}-12-31") in cutout_time
+            for year in years_in_time
+        )
 
-    config_hydro = snakemake.config["renewable"]["hydro"]
+        if full_years_available:
+            mask = [pd.Timestamp(t).year in years_in_time for t in cutout_time]
+            cutout = cutout.sel(time=cutout_time[mask])
+        else:
+            cutout = cutout.sel(time=time)
 
-    if config_hydro.get("eia_correct_by_capacity"):
-        fn = snakemake.input.eia_hydro_capacity
-        correct_eia_stats_by_capacity(eia_stats, fn, countries)
+        countries = snakemake.params.countries
+        country_shapes = (
+            gpd.read_file(snakemake.input.country_shapes)
+            .set_index("name")["geometry"]
+            .reindex(countries)
+        )
+        country_shapes.index.name = "countries"
 
-    if config_hydro.get("eia_approximate_missing"):
-        fn = snakemake.input.era5_runoff
-        eia_stats = approximate_missing_eia_stats(eia_stats, fn, countries)
+        fn = snakemake.input.eia_hydro_generation
+        eia_stats = get_eia_annual_hydro_generation(fn, countries)
 
-    norm_year = config_hydro.get("eia_norm_year")
-    missing_years = years_in_time.difference(eia_stats.index)
-    if norm_year:
-        eia_stats.loc[years_in_time] = eia_stats.loc[norm_year]
-    elif missing_years.any():
-        for year in missing_years:
-            eia_stats.loc[year] = eia_stats.median()
+        config_hydro = snakemake.config["renewable"]["hydro"]
 
-    inflow = cutout.runoff(
-        shapes=country_shapes,
-        smooth=True,
-        lower_threshold_quantile=True,
-        normalize_using_yearly=eia_stats,
-    )
+        if config_hydro.get("entsoe_annual_generation"):
+            eia_stats = override_eia_stats(
+                eia_stats, snakemake.input.entsoe_annual_generation, countries
+            )
 
-    if full_years_available:
-        inflow = inflow.sel(time=time)
+        if config_hydro.get("eia_correct_by_capacity"):
+            fn = snakemake.input.eia_hydro_capacity
+            correct_eia_stats_by_capacity(eia_stats, fn, countries)
 
-    if "clip_min_inflow" in params_hydro:
-        inflow = inflow.where(inflow > params_hydro["clip_min_inflow"], 0)
+        if config_hydro.get("eia_approximate_missing"):
+            fn = snakemake.input.era5_runoff
+            eia_stats = approximate_missing_eia_stats(eia_stats, fn, countries)
 
-    inflow.to_netcdf(snakemake.output.profile)
+        norm_year = config_hydro.get("eia_norm_year")
+        missing_years = years_in_time.difference(eia_stats.index)
+        if norm_year:
+            eia_stats.loc[years_in_time] = eia_stats.loc[norm_year]
+        elif missing_years.any():
+            for year in missing_years:
+                eia_stats.loc[year] = eia_stats.median()
+
+        inflow = cutout.runoff(
+            shapes=country_shapes,
+            smooth=True,
+            lower_threshold_quantile=True,
+            normalize_using_yearly=eia_stats,
+        )
+
+        if full_years_available:
+            inflow = inflow.sel(time=time)
+
+        if "clip_min_inflow" in params_hydro:
+            inflow = inflow.where(inflow > params_hydro["clip_min_inflow"], 0)
+
+        inflow.to_netcdf(snakemake.output.profile)

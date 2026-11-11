@@ -419,6 +419,14 @@ renewable:
     eia_norm_year: false
     eia_correct_by_capacity: false
     eia_approximate_missing: false
+    entsoe_annual_generation: ""
+    external:
+      enable: false
+      plants: ""
+      inflow: ""
+      inflow_and_storage: external
+      efficiency: costs
+      reservoir_units: ""
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#conventional
 conventional:

@@ -378,6 +378,152 @@ def load_and_aggregate_powerplants(
     return pd.concat([aggregated, disaggregated])
 
 
+def attach_hydro_external(
+    n: pypsa.Network,
+    costs: pd.DataFrame,
+    ppl_fn: str,
+    profile_hydro: str,
+    carriers: list,
+    efficiency: str = "costs",
+    reservoir_units: str = "",
+    **params,
+):
+    """
+    Attach plant-level hydro of an external dataset (macro-hydro-inputs).
+
+    The plants are the rows of the powerplant list with a ``plant_id``; their
+    series are in ``profile_hydro`` (``inflow`` [MW], ``p_max_pu``).
+
+    - ror: one generator per bus, capacity-weighted ``p_max_pu`` (already
+      electrical, no efficiency applied).
+    - hydro: one storage unit per plant, ``max_hours`` from the live storage,
+      discharge efficiency from the costs or from the plant (``eta_design``).
+      Inflow and storage exclude efficiency, so it is applied only on discharge.
+      With ``reservoir_units`` (CSV plant_id, unit; macro-hydro-inputs
+      scripts/aggregation/units.py) one storage unit per unit and bus instead:
+      capacity, storage and inflow summed, efficiency capacity-weighted.
+    - PHS: one storage unit per bus, no natural inflow.
+    """
+    add_missing_carriers(n, carriers)
+    add_co2_emissions(n, costs, carriers)
+
+    plants = pd.read_csv(ppl_fn, index_col=0, dtype={"bus": "str", "plant_id": "str"})
+    plants = plants[plants.plant_id.notna()].set_index("plant_id")
+    plants["carrier"] = plants.Technology.map(
+        {"Run-Of-River": "ror", "Reservoir": "hydro", "Pumped Storage": "PHS"}
+    )
+    ror = plants.query('carrier == "ror"')
+    phs = plants.query('carrier == "PHS"')
+    hydro = plants.query('carrier == "hydro"')
+
+    with xr.open_dataset(profile_hydro) as ds:
+        ds = ds.assign_coords(plant=ds.indexes["plant"].astype(str))
+        p_max_pu = ds["p_max_pu"].sel(plant=ror.index).to_pandas()
+        inflow = ds["inflow"].sel(plant=hydro.index).to_pandas()
+    p_max_pu.index = n.snapshots
+    inflow.index = n.snapshots
+
+    if "ror" in carriers and not ror.empty:
+        p_nom = ror.groupby("bus").Capacity.sum()
+        generation = p_max_pu.multiply(ror.Capacity).T.groupby(ror.bus).sum().T
+        names = p_nom.index + " ror"
+        n.add(
+            "Generator",
+            names,
+            carrier="ror",
+            bus=p_nom.index,
+            p_nom=p_nom.values,
+            efficiency=costs.at["ror", "efficiency"],
+            capital_cost=costs.at["ror", "capital_cost"],
+            weight=p_nom.values,
+            p_max_pu=generation.divide(p_nom).clip(upper=1.0).set_axis(names, axis=1),
+        )
+
+    if "PHS" in carriers and not phs.empty:
+        by_bus = phs.groupby("bus").agg(
+            p_nom=("Capacity", "sum"), storage=("StorageCapacity_MWh", "sum")
+        )
+        max_hours = (by_bus.storage / by_bus.p_nom).where(lambda s: s > 0)
+        max_hours = max_hours.fillna(params.get("PHS_max_hours", 6))
+        n.add(
+            "StorageUnit",
+            by_bus.index + " PHS",
+            carrier="PHS",
+            bus=by_bus.index,
+            p_nom=by_bus.p_nom.values,
+            capital_cost=costs.at["PHS", "capital_cost"],
+            max_hours=max_hours.values,
+            efficiency_store=np.sqrt(costs.at["PHS", "efficiency"]),
+            efficiency_dispatch=np.sqrt(costs.at["PHS", "efficiency"]),
+            cyclic_state_of_charge=True,
+        )
+
+    if "hydro" in carriers and not hydro.empty:
+        if efficiency == "plants":
+            efficiency_dispatch = hydro.eta_design.values
+        elif efficiency == "costs":
+            efficiency_dispatch = costs.at["hydro", "efficiency"]
+        else:
+            raise ValueError(f"Unknown external hydro efficiency: {efficiency}")
+        names = hydro.bus + " hydro " + hydro.index
+        if reservoir_units:
+            unit = pd.read_csv(reservoir_units, dtype=str).set_index("plant_id")["unit"]
+            unit = unit.reindex(hydro.index)
+            if unit.isna().any():
+                raise ValueError(
+                    f"External hydro: {unit.isna().sum()} reservoirs not in {reservoir_units}"
+                )
+            key = hydro.bus + " hydro " + unit
+            eta = pd.Series(efficiency_dispatch, index=hydro.index, dtype=float)
+            cap = hydro.Capacity.groupby(key).sum()
+            efficiency_dispatch = ((eta * hydro.Capacity).groupby(key).sum() / cap).values
+            inflow = inflow.T.groupby(key.values).sum().T[cap.index]
+            hydro = pd.DataFrame(
+                {
+                    "bus": hydro.bus.groupby(key).first(),
+                    "Capacity": cap,
+                    "StorageCapacity_MWh": hydro.StorageCapacity_MWh.fillna(0)
+                    .groupby(key)
+                    .sum(),
+                }
+            )
+            names = hydro.index.to_series()
+            logger.info(
+                f"External hydro: {len(key)} reservoirs aggregated into {len(hydro)} "
+                f"units ({unit.nunique()} groups split by bus), {reservoir_units}"
+            )
+        no_storage = hydro.StorageCapacity_MWh.fillna(0) <= 0
+        if no_storage.any():
+            logger.warning(
+                f"External hydro: {no_storage.sum()} reservoirs without storage "
+                f"({', '.join(hydro.index[no_storage])}): inflow is dispatched or spilled at once"
+            )
+        n.add(
+            "StorageUnit",
+            names,
+            carrier="hydro",
+            bus=hydro.bus.values,
+            p_nom=hydro.Capacity.values,
+            max_hours=(hydro.StorageCapacity_MWh.fillna(0) / hydro.Capacity).values,
+            capital_cost=costs.at["hydro", "capital_cost"],
+            marginal_cost=costs.at["hydro", "marginal_cost"],
+            p_max_pu=1.0,  # dispatch
+            p_min_pu=0.0,  # store
+            efficiency_dispatch=efficiency_dispatch,
+            efficiency_store=0.0,
+            cyclic_state_of_charge=True,
+            inflow=inflow.set_axis(names, axis=1),
+        )
+
+    logger.info(
+        "External hydro: added "
+        f"{len(ror.bus.unique())} ror generators ({ror.Capacity.sum() / 1e3:.1f} GW), "
+        f"{len(hydro)} reservoirs ({hydro.Capacity.sum() / 1e3:.1f} GW, "
+        f"{hydro.StorageCapacity_MWh.sum() / 1e6:.1f} TWh), "
+        f"{len(phs.bus.unique())} PHS units ({phs.Capacity.sum() / 1e3:.1f} GW)"
+    )
+
+
 def attach_load(
     n: pypsa.Network,
     load_fn: str,
@@ -1282,15 +1428,31 @@ if __name__ == "__main__":
     if "hydro" in renewable_carriers:
         p = params.renewable["hydro"]
         carriers = p.pop("carriers", [])
-        attach_hydro(
-            n,
-            costs,
-            ppl,
-            snakemake.input.profile_hydro,
-            snakemake.input.hydro_capacities,
-            carriers,
-            **p,
-        )
+        external_hydro = p.pop("external", {})
+        if (
+            external_hydro.get("enable", False)
+            and external_hydro.get("inflow_and_storage", "external") == "external"
+        ):
+            attach_hydro_external(
+                n,
+                costs,
+                snakemake.input.powerplants,
+                snakemake.input.profile_hydro,
+                carriers,
+                efficiency=external_hydro.get("efficiency", "costs"),
+                reservoir_units=external_hydro.get("reservoir_units", ""),
+                **p,
+            )
+        else:
+            attach_hydro(
+                n,
+                costs,
+                ppl,
+                snakemake.input.profile_hydro,
+                snakemake.input.hydro_capacities,
+                carriers,
+                **p,
+            )
 
     estimate_renewable_caps = params.electricity["estimate_renewable_capacities"]
     if estimate_renewable_caps["enable"]:

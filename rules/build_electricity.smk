@@ -32,8 +32,37 @@ rule build_electricity_demand:
         scripts("build_electricity_demand.py")
 
 
+def input_external_hydro_plants(w):
+    """Plant table of the external hydro dataset."""
+    external = config_provider("renewable", "hydro", "external", default={})(w)
+    if not external.get("enable", False):
+        return {}
+    return {"external_hydro_plants": external["plants"]}
+
+
+def input_external_hydro_inflow(w):
+    """Plant table and one inflow file per snapshot year of the external hydro dataset."""
+    external = config_provider("renewable", "hydro", "external", default={})(w)
+    if not external.get("enable", False):
+        return {}
+    if external.get("inflow_and_storage", "external") != "external":
+        return {}
+    snapshots = config_provider("snapshots")(w)
+    years = pd.date_range(
+        snapshots["start"],
+        snapshots["end"],
+        freq="h",
+        inclusive=snapshots.get("inclusive", "left"),
+    ).year.unique()
+    return {
+        "external_hydro_plants": external["plants"],
+        "external_hydro_inflow": [external["inflow"].format(year=y) for y in years],
+    }
+
+
 rule build_powerplants:
     input:
+        unpack(input_external_hydro_plants),
         network=resources("networks/base_s_{clusters}.nc"),
         regions_onshore=resources("regions_onshore_base_s_{clusters}.geojson"),
         regions_offshore=resources("regions_offshore_base_s_{clusters}.geojson"),
@@ -53,6 +82,7 @@ rule build_powerplants:
         custom_powerplants=config_provider("electricity", "custom_powerplants"),
         everywhere_powerplants=config_provider("electricity", "everywhere_powerplants"),
         countries=config_provider("countries"),
+        external_hydro=config_provider("renewable", "hydro", "external", default={}),
     message:
         "Building powerplant list for {wildcards.clusters} clusters"
     script:
@@ -195,7 +225,7 @@ if CUTOUT_DATASET["source"] in ["build"]:
 
     rule build_cutout:
         output:
-            cutout=CUTOUT_DATASET["folder"] / "{cutout}.nc",
+            cutout=f"{CUTOUT_DATASET['folder']}/{{cutout}}.nc",
         log:
             "logs/build_cutout/{cutout}.log",
         benchmark:
@@ -454,10 +484,15 @@ if COUNTRY_RUNOFF_DATASET["source"] == "build":
 
 rule build_hydro_profile:
     input:
+        unpack(input_external_hydro_inflow),
         country_shapes=resources("country_shapes.geojson"),
         eia_hydro_generation="data/eia_hydro_annual_generation.csv",
         eia_hydro_capacity="data/eia_hydro_annual_capacity.csv",
         era5_runoff=f"{COUNTRY_RUNOFF_DATASET['folder']}/era5-runoff-per-country.csv",
+        entsoe_annual_generation=lambda w: (
+            config_provider("renewable", "hydro", "entsoe_annual_generation", default="")(w)
+            or []
+        ),
         cutout=lambda w: input_cutout(
             w, config_provider("renewable", "hydro", "cutout")(w)
         ),
