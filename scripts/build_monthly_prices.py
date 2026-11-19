@@ -21,7 +21,7 @@ from pydeflate import imf_gdp_deflate, set_pydeflate_path
 
 from scripts._helpers import configure_logging, set_scenario_config
 
-set_pydeflate_path("../data/pydeflate/")
+set_pydeflate_path("data/pydeflate/")
 
 logger = logging.getLogger(__name__)
 
